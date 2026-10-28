@@ -1,7 +1,7 @@
 PREFIX ?= $(HOME)/.local
 
-blackout: blackout.swift
-	swiftc -O -o $@ $<
+blackout: blackout.swift CGVirtualDisplay.h
+	swiftc -O -import-objc-header CGVirtualDisplay.h -o $@ blackout.swift
 
 install: blackout
 	install -d $(PREFIX)/bin
