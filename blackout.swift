@@ -7,7 +7,10 @@
 // вікно може втратити фокус (сповіщення, інший застосунок, заставка), і тоді клавіші до нього не доходять.
 //
 // blackout --restore — підключити всі дисплеї, якщо blackout завершився аварійно і зовнішній дисплей лишився вимкненим.
+// blackout --menubar — іконка в панелі меню і гаряча клавіша ⌃⌥⌘B; кожне затемнення — окремий процес blackout,
+// тож аварія затемнення не зачіпає іконку.
 import AppKit
+import Carbon
 import IOKit
 import IOKit.pwr_mgt
 
@@ -68,6 +71,56 @@ if CommandLine.arguments.dropFirst().first == "--restore" {
     for id in allDisplays() { _ = configure(id, enabled: true, options: [.forSession]) }
     exit(0)
 }
+
+var child: Process?
+
+// Запускає цей самий файл з аргументами. Друге затемнення, поки працює перше, не запускається.
+func runSelf(_ arguments: [String] = []) {
+    if arguments.isEmpty, child?.isRunning == true { return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+    p.arguments = arguments
+    try? p.run()
+    if arguments.isEmpty { child = p }
+}
+
+final class MenuTarget: NSObject {
+    @objc func blackout() { runSelf() }
+    @objc func restoreDisplays() { runSelf(["--restore"]) }
+}
+
+func runMenuBar() -> Never {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let target = MenuTarget()
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    item.button?.image = NSImage(systemSymbolName: "moon.fill", accessibilityDescription: "blackout")
+    let menu = NSMenu()
+    let off = NSMenuItem(title: "Погасити екрани", action: #selector(MenuTarget.blackout), keyEquivalent: "b")
+    off.keyEquivalentModifierMask = [.control, .option, .command]
+    menu.addItem(off)
+    menu.addItem(NSMenuItem(title: "Підключити всі дисплеї", action: #selector(MenuTarget.restoreDisplays), keyEquivalent: ""))
+    menu.addItem(.separator())
+    menu.addItem(NSMenuItem(title: "Вийти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
+    for i in menu.items where i.action != #selector(NSApplication.terminate(_:)) { i.target = target }
+    item.menu = menu
+
+    // Carbon RegisterEventHotKey не потребує дозволу Accessibility, на відміну від глобального монітора подій.
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in runSelf(); return noErr }, 1, &spec, nil, nil)
+    var hotKey: EventHotKeyRef?
+    let status = RegisterEventHotKey(UInt32(kVK_ANSI_B), UInt32(controlKey | optionKey | cmdKey),
+        EventHotKeyID(signature: OSType(0x626c6b74), id: 1), GetApplicationEventTarget(), 0, &hotKey)
+    if status != noErr {
+        // Комбінацію вже зайняв інший застосунок: лишається тільки пункт меню.
+        off.keyEquivalent = ""
+        FileHandle.standardError.write("blackout: ⌃⌥⌘B зайнята (\(status)), лишається тільки меню\n".data(using: .utf8)!)
+    }
+    withExtendedLifetime((target, item, hotKey)) { app.run() }
+    exit(0)
+}
+
+if CommandLine.arguments.dropFirst().first == "--menubar" { runMenuBar() }
 
 var saved: [UInt32: Float] = [:]
 for screen in NSScreen.screens {
@@ -179,8 +232,10 @@ for screen in NSScreen.screens {
 }
 NSCursor.hide()
 
-// Пів секунди паузи, щоб відпускання Enter після запуску команди не повернуло екран одразу.
-DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+// Затемнити після пів секунди без дій: інакше відпускання Enter чи гарячої клавіші одразу поверне екран.
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { start in
+    guard (hidIdleSeconds() ?? 1) >= 0.5 else { return }
+    start.invalidate()
     disconnectExternalDisplays()
     for id in saved.keys where !disconnected.contains(id) { _ = setB?(id, 0) }
     var last = hidIdleSeconds() ?? 0
