@@ -43,8 +43,9 @@ func allDisplays() -> [CGDirectDisplayID] {
     return Array(ids.prefix(Int(n)))
 }
 
-// .forAppOnly: за документацією CGConfigureOption зміна діє, поки працює процес, тож після аварійного
-// завершення macOS має сама підключити дисплей. Якщо .forAppOnly не приймається — .forSession.
+// .forAppOnly: за документацією CGConfigureOption зміна діє, поки працює процес. Перевірено 2026-10-28 на
+// macOS 27: після kill -9 від'єднаний дисплей лишається вимкненим, тож його підключає процес іконки (blackoutEnded).
+// Якщо .forAppOnly не приймається — .forSession.
 func configure(_ id: CGDirectDisplayID, enabled: Bool, options: [CGConfigureOption]) -> Bool {
     guard let setEnabled else { return false }
     for option in options {
@@ -67,12 +68,62 @@ func waitUntil(seconds: Double, until done: () -> Bool) -> Bool {
     return true
 }
 
-if CommandLine.arguments.dropFirst().first == "--restore" {
+// Віртуальний дисплей blackout розпізнається за vendorID: його не від'єднують і не вважають зовнішнім.
+let blackoutVendor: UInt32 = 0xb1ac
+func isBlackoutVirtual(_ id: CGDirectDisplayID) -> Bool { CGDisplayVendorNumber(id) == blackoutVendor }
+
+// Віртуальний дисплей з тим самим режимом, що й у фізичного: вікна, які переїдуть на нього, збережуть розмір.
+func makeVirtualDisplay(like id: CGDirectDisplayID) -> CGVirtualDisplay? {
+    guard let mode = CGDisplayCopyDisplayMode(id) else { return nil }
+    let descriptor = CGVirtualDisplayDescriptor()
+    descriptor.setDispatchQueue(DispatchQueue.main)
+    descriptor.name = "blackout"
+    descriptor.maxPixelsWide = UInt32(mode.pixelWidth)
+    descriptor.maxPixelsHigh = UInt32(mode.pixelHeight)
+    descriptor.sizeInMillimeters = CGDisplayScreenSize(id)
+    descriptor.vendorID = blackoutVendor
+    descriptor.productID = 1
+    descriptor.serialNum = 1
+    guard let display = CGVirtualDisplay(descriptor: descriptor) else { return nil }
+    let settings = CGVirtualDisplaySettings()
+    settings.hiDPI = mode.pixelWidth > mode.width ? 1 : 0
+    settings.modes = [CGVirtualDisplayMode(width: UInt32(mode.width), height: UInt32(mode.height), refreshRate: 60)]
+    guard display.apply(settings) else { return nil }
+    let ready = waitUntil(seconds: 3) { onlineDisplays().contains(display.displayID) }
+    return ready ? display : nil
+}
+
+// Підключити всі дисплеї: після аварійного завершення затемнення macOS сама їх не підключає.
+func enableAll() {
     for id in allDisplays() { _ = configure(id, enabled: true, options: [.forSession]) }
+}
+
+if CommandLine.arguments.dropFirst().first == "--restore" {
+    enableAll()
     exit(0)
 }
 
 var child: Process?
+// Віртуальний дисплей на час затемнення з закритою кришкою. Його тримає процес іконки, а не процес затемнення:
+// віртуальний дисплей зникає разом із процесом, і якщо затемнення аварійно завершилось, macOS забуває
+// від'єднаний зовнішній дисплей — його не повертає ні --restore, ні CGSConfigureDisplayEnabled.
+var heldVirtual: CGVirtualDisplay?
+
+// Без вбудованого дисплея (кришка закрита) і з зовнішнім — затемненню потрібен віртуальний дисплей.
+func needsVirtualDisplay() -> Bool {
+    let online = onlineDisplays()
+    return !online.isEmpty && !online.contains { CGDisplayIsBuiltin($0) != 0 || isBlackoutVirtual($0) }
+}
+
+// Затемнення завершилось. Аварійно — підключити всі дисплеї; потім прибрати віртуальний дисплей,
+// коли фізичний уже працює, інакше на мить не лишиться жодного дисплея.
+func blackoutEnded(_ p: Process) {
+    if p.terminationReason == .uncaughtSignal || p.terminationStatus != 0 { enableAll() }
+    if heldVirtual != nil {
+        waitUntil(seconds: 5) { onlineDisplays().contains { !isBlackoutVirtual($0) && CGDisplayIsActive($0) != 0 } }
+        heldVirtual = nil
+    }
+}
 
 // Запускає цей самий файл з аргументами. Друге затемнення, поки працює перше, не запускається.
 func runSelf(_ arguments: [String] = []) {
@@ -80,7 +131,11 @@ func runSelf(_ arguments: [String] = []) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
     p.arguments = arguments
-    try? p.run()
+    if arguments.isEmpty {
+        if heldVirtual == nil, needsVirtualDisplay() { heldVirtual = makeVirtualDisplay(like: CGMainDisplayID()) }
+        p.terminationHandler = { p in DispatchQueue.main.async { blackoutEnded(p) } }
+    }
+    do { try p.run() } catch { if arguments.isEmpty { blackoutEnded(p) }; return }
     if arguments.isEmpty { child = p }
 }
 
@@ -164,35 +219,15 @@ func hidIdleSeconds() -> Double? {
     return value.doubleValue / 1_000_000_000
 }
 
-// Віртуальний дисплей з тим самим режимом, що й у фізичного: вікна, які переїдуть на нього, збережуть розмір.
-func makeVirtualDisplay(like id: CGDirectDisplayID) -> CGVirtualDisplay? {
-    guard let mode = CGDisplayCopyDisplayMode(id) else { return nil }
-    let descriptor = CGVirtualDisplayDescriptor()
-    descriptor.setDispatchQueue(DispatchQueue.main)
-    descriptor.name = "blackout"
-    descriptor.maxPixelsWide = UInt32(mode.pixelWidth)
-    descriptor.maxPixelsHigh = UInt32(mode.pixelHeight)
-    descriptor.sizeInMillimeters = CGDisplayScreenSize(id)
-    descriptor.vendorID = 0xb1ac
-    descriptor.productID = 1
-    descriptor.serialNum = 1
-    guard let display = CGVirtualDisplay(descriptor: descriptor) else { return nil }
-    let settings = CGVirtualDisplaySettings()
-    settings.hiDPI = mode.pixelWidth > mode.width ? 1 : 0
-    settings.modes = [CGVirtualDisplayMode(width: UInt32(mode.width), height: UInt32(mode.height), refreshRate: 60)]
-    guard display.apply(settings) else { return nil }
-    let ready = waitUntil(seconds: 3) { onlineDisplays().contains(display.displayID) }
-    return ready ? display : nil
-}
-
 // Від'єднати зовнішні дисплеї. Коли кришка закрита, вбудованого дисплея немає, і без жодного дисплея
 // macOS може приспати Mac (а сон розриває VPN), тож спершу створюється віртуальний дисплей.
 // Не вдалося створити віртуальний або від'єднати — дисплей лишається під яскравістю 0 і чорним вікном.
 func disconnectExternalDisplays() {
     let online = onlineDisplays()
-    let external = online.filter { CGDisplayIsBuiltin($0) == 0 }
+    let external = online.filter { CGDisplayIsBuiltin($0) == 0 && !isBlackoutVirtual($0) }
     guard !external.isEmpty, setEnabled != nil else { return }
-    if !online.contains(where: { CGDisplayIsBuiltin($0) != 0 }) {
+    // Віртуальний дисплей міг уже створити процес іконки.
+    if !online.contains(where: { CGDisplayIsBuiltin($0) != 0 || isBlackoutVirtual($0) }) {
         guard let display = makeVirtualDisplay(like: CGMainDisplayID()) else { return }
         virtualDisplay = display
     }
