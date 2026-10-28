@@ -15,6 +15,13 @@ install-menubar: install
 	-launchctl bootout gui/$$(id -u) $(AGENT) 2>/dev/null
 	launchctl bootstrap gui/$$(id -u) $(AGENT)
 
+# Кнопка для Control Center: Shortcut «Blackout» виконує `blackout --trigger`.
+# Shortcuts спитає підтвердження імпорту; потрібне Settings → Advanced → Allow Running Scripts.
+install-shortcut: Blackout.shortcut.plist
+	plutil -convert binary1 -o $(TMPDIR)blackout-unsigned.shortcut Blackout.shortcut.plist
+	shortcuts sign --mode anyone --input $(TMPDIR)blackout-unsigned.shortcut --output $(TMPDIR)Blackout.shortcut
+	open $(TMPDIR)Blackout.shortcut
+
 uninstall-menubar:
 	-launchctl bootout gui/$$(id -u) $(AGENT)
 	rm -f $(AGENT)
@@ -22,4 +29,4 @@ uninstall-menubar:
 clean:
 	rm -f blackout
 
-.PHONY: install install-menubar uninstall-menubar clean
+.PHONY: install install-menubar install-shortcut uninstall-menubar clean

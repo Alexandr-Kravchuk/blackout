@@ -9,6 +9,8 @@
 // blackout --restore — підключити всі дисплеї, якщо blackout завершився аварійно і зовнішній дисплей лишився вимкненим.
 // blackout --menubar — іконка в панелі меню і гаряча клавіша ⌃⌥⌘B; кожне затемнення — окремий процес blackout,
 // тож аварія затемнення не зачіпає іконку.
+// blackout --trigger — попросити процес іконки погасити екрани (сигнал SIGUSR1); для кнопки в Control Center
+// через Shortcuts. Процесу іконки немає — затемнення в цьому процесі.
 import AppKit
 import Carbon
 import IOKit
@@ -171,11 +173,25 @@ func runMenuBar() -> Never {
         off.keyEquivalent = ""
         FileHandle.standardError.write("blackout: ⌃⌥⌘B зайнята (\(status)), лишається тільки меню\n".data(using: .utf8)!)
     }
-    withExtendedLifetime((target, item, hotKey)) { app.run() }
+    // SIGUSR1 від blackout --trigger: затемнення, як з гарячої клавіші.
+    signal(SIGUSR1, SIG_IGN)
+    let trigger = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+    trigger.setEventHandler { runSelf() }
+    trigger.resume()
+    withExtendedLifetime((target, item, hotKey, trigger)) { app.run() }
     exit(0)
 }
 
 if CommandLine.arguments.dropFirst().first == "--menubar" { runMenuBar() }
+
+if CommandLine.arguments.dropFirst().first == "--trigger" {
+    let pkill = Process()
+    pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    pkill.arguments = ["-USR1", "-u", String(getuid()), "-f", "blackout --menubar$"]
+    try? pkill.run()
+    pkill.waitUntilExit()
+    if pkill.terminationStatus == 0 { exit(0) }
+}
 
 var saved: [UInt32: Float] = [:]
 for screen in NSScreen.screens {
